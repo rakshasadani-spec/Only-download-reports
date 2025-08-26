@@ -110,12 +110,18 @@ async def run_automation():
         await page.wait_for_load_state("networkidle")
 
         # ----------------------- 2) REPORTS TAB ------------------------------
-        # Left-side "Reports" navigation
+        # Click the first visible Reports link (avoid strict mode violation)
         try:
-            await page.get_by_role("link", name=re.compile(r"reports?", re.I)).click(timeout=8000)
+            # Prefer stable URL match if present
+            await page.locator("a[href*='/app/reports']").first.click(timeout=8000)
         except PWTimeoutError:
-            # Some apps use a button/div/span
-            await page.get_by_text("Reports", exact=False).first.click()
+            # Fallback: role-based, then pick the first visible element
+            reports_links = page.get_by_role("link", name=re.compile(r"reports?", re.I))
+            if await reports_links.count() == 0:
+                # Some UIs use buttons/spans for menu
+                await page.get_by_text("Reports", exact=False).first.click()
+            else:
+                await reports_links.first.click()
         await page.wait_for_load_state("networkidle")
 
         # ----------------------- 3) SELECT REPORT ----------------------------
