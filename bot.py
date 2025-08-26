@@ -62,6 +62,7 @@ def contexts(page: Page) -> List[Union[Page, Frame]]:
 
 async def try_click(locator: Locator, timeout: int = 1500) -> bool:
     try:
+        await locator.first.scroll_into_view_if_needed(timeout=timeout)
         await locator.first.click(timeout=timeout)
         return True
     except Exception:
@@ -69,7 +70,6 @@ async def try_click(locator: Locator, timeout: int = 1500) -> bool:
 
 # --- Left sidebar "Reports" (3rd from top) ----------------------------------
 async def click_reports_nav(page: Page):
-    # 1) Sidebar container
     sidebar = page.locator("#reportLeftMenu")
     try:
         await sidebar.wait_for(state="visible", timeout=8000)
@@ -81,10 +81,8 @@ async def click_reports_nav(page: Page):
             return
     except Exception:
         pass
-    # 2) URL-based inside sidebar
     if await try_click(page.locator("#reportLeftMenu a[href*='/app/reports']"), 3000):
         return
-    # 3) Anywhere
     if await try_click(page.get_by_role("link", name=re.compile(r"\bReports\b", re.I)), 3000):
         return
     await page.get_by_text("Reports", exact=False).first.click()
@@ -105,7 +103,7 @@ async def select_report(ctx: Union[Page, Frame], option_text: str, timeout_ms: i
     except Exception:
         pass
 
-    # 2) Click the control next to "Report" (custom dropdowns)
+    # 2) Custom dropdowns
     opened = False
     try:
         box = ctx.locator("xpath=//label[contains(., 'Report')]/following::*[self::div or self::button or self::span or self::input][1]")
@@ -115,7 +113,6 @@ async def select_report(ctx: Union[Page, Frame], option_text: str, timeout_ms: i
     if not opened:
         opened = await try_click(ctx.get_by_role("combobox"), 2000)
 
-    # panels to search options in
     if opened:
         panels = [
             "[role='listbox']",
@@ -182,31 +179,32 @@ async def set_as_on_date(ctx: Union[Page, Frame], dt: datetime.date):
     iso = dt.strftime("%Y-%m-%d")
     dmy_slash = dt.strftime("%d/%m/%Y")
 
+    # Target the input next to the "As on Date" label (common case)
     inp = ctx.locator("xpath=//label[contains(., 'As on Date')]/following::input[1]")
     try:
         await inp.first.wait_for(state="visible", timeout=4000)
 
-        # Strategy A: type dd/mm/YYYY
+        # A) type dd/mm/YYYY
         try:
             await inp.first.click()
             await inp.first.press("Control+A")
             await inp.first.type(dmy_slash)
-            await inp.first.press("Enter")
+            await inp.first.press("Tab")
             print("[DEBUG] Date set via typing (dd/mm/YYYY).")
             return
         except Exception:
             pass
 
-        # Strategy B: fill ISO
+        # B) fill ISO then blur
         try:
             await inp.first.fill(iso)
-            await inp.first.press("Enter")
+            await inp.first.press("Tab")
             print("[DEBUG] Date set via fill (YYYY-mm-dd).")
             return
         except Exception:
             pass
 
-        # Strategy C: JS setter + events
+        # C) native setter + events
         try:
             await set_input_value_with_events(inp.first, dmy_slash)
             print("[DEBUG] Date set via JS setter + events.")
@@ -215,9 +213,10 @@ async def set_as_on_date(ctx: Union[Page, Frame], dt: datetime.date):
             pass
 
     except Exception:
-        pass  # couldn't find labeled input
+        # couldn't find that labeled input; fall through
+        pass
 
-    # Strategy D: open datepicker and click day
+    # D) open datepicker and pick the day
     toggles = [
         "xpath=//label[contains(., 'As on Date')]/following::*[contains(@class,'datepicker') or contains(@aria-label,'calendar') or self::button][1]",
         ".mat-datepicker-toggle",
@@ -232,10 +231,10 @@ async def set_as_on_date(ctx: Union[Page, Frame], dt: datetime.date):
 
     if opened:
         labels = [
-            dt.strftime("%-d %B %Y"),  # 24 August 2025 (Linux)
-            dt.strftime("%d %B %Y"),   # 24 August 2025 (zero-padded)
+            dt.strftime("%-d %B %Y"),  # Linux: 24 August 2025
+            dt.strftime("%d %B %Y"),   # zero-padded day
             dt.strftime("%-d %b %Y"),  # 24 Aug 2025
-            dt.strftime("%d %b %Y"),   # 24 Aug 2025 (padded)
+            dt.strftime("%d %b %Y"),   # padded
         ]
         for lab in labels:
             try:
@@ -256,31 +255,52 @@ async def set_as_on_date(ctx: Union[Page, Frame], dt: datetime.date):
 
     print("[WARN] Could not set date; using site's default.")
 
+# --- Click Execute robustly --------------------------------------------------
 async def click_execute(ctx: Union[Page, Frame]):
-    # Prefer role=button Execute
-    btn = ctx.get_by_role("button", name=re.compile(r"\bexecute\b", re.I)).first
+    # Prefer a real <button> Execute, else JS-click
+    labels = r"\b(Execute|Run|Generate|Submit|View Report|View)\b"
+    btn = ctx.get_by_role("button", name=re.compile(labels, re.I)).first
     try:
-        await btn.wait_for(state="visible", timeout=5000)
-        await btn.click()
-        print("[DEBUG] Clicked Execute via role=button.")
+        await btn.wait_for(state="visible", timeout=6000)
+        # Try to ensure enabled
+        try:
+            await btn.evaluate("el => el.scrollIntoView({block:'center'})")
+        except Exception:
+            pass
+        try:
+            await btn.click()
+        except Exception:
+            await btn.evaluate("el => el.click()")
+        print("[DEBUG] Clicked Execute.")
         return
     except Exception:
         pass
-    # Text fallback
-    if await try_click(ctx.get_by_text("Execute", exact=False), 5000):
+
+    # Text fallback anywhere
+    any_text = ctx.get_by_text(re.compile(labels, re.I))
+    if await try_click(any_text, 5000):
         print("[DEBUG] Clicked Execute via text fallback.")
         return
+
     await safe_screenshot(ctx, "debug_execute_click_failed.png")
     raise RuntimeError("Could not click Execute.")
 
+# --- Switch to 'Report Executions' tab --------------------------------------
+async def open_report_executions(ctx: Union[Page, Frame]):
+    # Tabs may be role="tab" or plain links
+    if await try_click(ctx.get_by_role("tab", name=re.compile(r"Report Executions", re.I)), 3000):
+        return
+    if await try_click(ctx.get_by_text("Report Executions", exact=False), 3000):
+        return
+
+# --- Find the download button for our report --------------------------------
 async def find_download_button(ctx: Union[Page, Frame], title: str) -> Optional[Locator]:
     row = ctx.get_by_role("row").filter(has=ctx.get_by_text(title, exact=False)).first
     candidates = [
-        row.get_by_role("button", name=re.compile(r"download|document|file|xlsx|excel|csv", re.I)),
-        row.get_by_role("link", name=re.compile(r"download|document|file|xlsx|excel|csv", re.I)),
+        row.get_by_role("button", name=re.compile(r"download|document|file|xlsx|excel|csv|pdf", re.I)),
+        row.get_by_role("link", name=re.compile(r"download|document|file|xlsx|excel|csv|pdf", re.I)),
         row.locator("a[download]"),
         row.locator("button:has(svg), a:has(svg)"),
-        ctx.get_by_role("button", name=re.compile(r"document", re.I)).first,
     ]
     for c in candidates:
         try:
@@ -299,110 +319,4 @@ async def run_automation():
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(accept_downloads=True)
-        page = await context.new_page()
-
-        # 1) LOGIN
-        await page.goto(LOGIN_URL, wait_until="networkidle")
-        creds = [
-            ("input[name='username']", "input[name='password']"),
-            ("input#username", "input#password"),
-            ("input[autocomplete='username']", "input[autocomplete='current-password']"),
-        ]
-        filled = False
-        for u_sel, p_sel in creds:
-            try:
-                await page.fill(u_sel, USERNAME, timeout=2500)
-                await page.fill(p_sel, PASSWORD, timeout=2500)
-                filled = True
-                break
-            except PWTimeoutError:
-                continue
-        if not filled:
-            try:
-                await page.get_by_placeholder(re.compile("user", re.I)).fill(USERNAME, timeout=2500)
-                await page.get_by_placeholder(re.compile("pass|pwd", re.I)).fill(PASSWORD, timeout=2500)
-                filled = True
-            except PWTimeoutError:
-                pass
-        if not filled:
-            await safe_screenshot(page, "debug_login_fields.png")
-            raise RuntimeError("Could not locate login fields.")
-        try:
-            await page.get_by_role("button", name=re.compile(r"log ?in", re.I)).click()
-        except PWTimeoutError:
-            await page.click("button[type='submit']")
-        await page.wait_for_load_state("networkidle")
-
-        # 2) REPORTS TAB (left sidebar)
-        await click_reports_nav(page)
-        await page.wait_for_load_state("networkidle")
-
-        # 3) SELECT REPORT (Page or frames)
-        picked_ctx: Optional[Union[Page, Frame]] = None
-        for ctx in contexts(page):
-            ok = await select_report(ctx, REPORT_TITLE, timeout_ms=9000)
-            if ok:
-                picked_ctx = ctx
-                break
-        if not picked_ctx:
-            await safe_screenshot(page, "debug_select_report_failed.png")
-            raise RuntimeError(f"Could not select report '{REPORT_TITLE}'.")
-
-        # 4) DATE = yesterday (force-set so Execute enables)
-        await set_as_on_date(picked_ctx, YESTERDAY)
-
-        # 5) EXECUTE
-        await click_execute(picked_ctx)
-
-        # 6) WAIT + DOWNLOAD
-        btn = None
-        for _ in range(180):   # ~90s
-            btn = await find_download_button(picked_ctx, REPORT_TITLE)
-            if btn:
-                break
-            await picked_ctx.wait_for_timeout(500)
-        if not btn:
-            await safe_screenshot(picked_ctx, "debug_download_icon_missing.png")
-            raise RuntimeError("Report did not become downloadable in time.")
-
-        async with page.expect_download() as dl_info:
-            await btn.click()
-        download = await dl_info.value
-        suggested = download.suggested_filename or DEFAULT_FILENAME
-        file_path = DOWNLOAD_DIR / suggested
-        await download.save_as(file_path)
-        print(f"Downloaded: {file_path}")
-
-        await context.close()
-        await browser.close()
-
-    if email_config_ok():
-        email_files([file_path])
-    else:
-        print("[INFO] Skipping email step.")
-
-# =============================== Email helper ================================
-def email_files(paths):
-    msg = MIMEMultipart()
-    msg["From"] = FROM_EMAIL
-    msg["To"] = TO_EMAIL
-    msg["Subject"] = f"{REPORT_TITLE} – {YESTERDAY.isoformat()}"
-    body = f"Attached is the {REPORT_TITLE} for {YESTERDAY.isoformat()}."
-    msg.attach(MIMEText(body, "plain"))
-    for p in paths:
-        with open(p, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f"attachment; filename={Path(p).name}")
-        msg.attach(part)
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
-        print("Email sent to:", TO_EMAIL)
-
-# =============================== Entrypoint ==================================
-if __name__ == "__main__":
-    asyncio.run(run_automation())
+        context = await browser.new_context(accept_downl
