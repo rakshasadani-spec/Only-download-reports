@@ -1,69 +1,68 @@
-import os
-continue
-return None
+name: Nuvama Daily Capital Flows Report
 
+on:
+  schedule:
+    # 03:30 UTC = 09:00 IST daily
+    - cron: "30 3 * * *"
+  workflow_dispatch: {}   # enables the “Run workflow” button
 
-# Poll until the icon becomes available (spinner disappears)
-btn = None
-for _ in range(120): # ~120 * 500ms = 60s
-btn = await find_download_button()
-if btn:
-break
-await page.wait_for_timeout(500)
-if not btn:
-raise RuntimeError("Report did not become downloadable in time. Increase timeout or refine selectors.")
+permissions:
+  contents: read
 
+concurrency:
+  group: nuvama-daily
+  cancel-in-progress: false
 
-async with page.expect_download() as dl_info:
-await btn.click()
-download = await dl_info.value
-suggested = download.suggested_filename or DEFAULT_FILENAME
-file_path = DOWNLOAD_DIR / suggested
-await download.save_as(file_path)
-print(f"Downloaded: {file_path}")
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-await context.close()
-await browser.close()
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-if ENABLE_EMAIL:
-email_files([file_path])
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
+      - name: Run report downloader
+        env:
+          WEBSITE_USER: ${{ secrets.WEBSITE_USER }}
+          WEBSITE_PASS: ${{ secrets.WEBSITE_PASS }}
+          # Optional overrides (default LOGIN_URL already set in bot.py)
+          LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          # Optional email settings
+          ENABLE_EMAIL: ${{ secrets.ENABLE_EMAIL }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        run: |
+          python --version
+          python bot.py
 
-
-
-def email_files(paths):
-if not TO_EMAIL:
-print("[WARN] ENABLE_EMAIL is true but TO_EMAIL is empty; skipping email.")
-return
-msg = MIMEMultipart()
-msg["From"] = FROM_EMAIL
-msg["To"] = TO_EMAIL
-msg["Subject"] = f"Statement of Capital Flows – {YESTERDAY.isoformat()}"
-
-
-body = f"Attached is the Statement of Capital Flows for {YESTERDAY.isoformat()}."
-msg.attach(MIMEText(body, "plain"))
-
-
-for p in paths:
-with open(p, "rb") as f:
-part = MIMEBase("application", "octet-stream")
-part.set_payload(f.read())
-encoders.encode_base64(part)
-part.add_header("Content-Disposition", f"attachment; filename={Path(p).name}")
-msg.attach(part)
-
-
-with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-server.starttls()
-server.login(SMTP_USER, SMTP_PASS)
-server.send_message(msg)
-print("Email sent to:", TO_EMAIL)
-
-
-
-
-if __name__ == "__main__":
-asyncio.run(run_automation())
+      - name: Upload downloaded files
+        if: always()   # upload even if the run failed (helps debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: capital-flows-${{ github.run_id }}
+          path: downloads/**
+          if-no-files-found: warn
