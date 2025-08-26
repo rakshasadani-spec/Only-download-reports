@@ -26,18 +26,30 @@ LOGIN_URL = os.getenv(
     "https://eclientreporting.nuvamaassetservices.com/wealthspectrum/app/loginWith",
 )
 
-# Optional email settings
-ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "false").lower() == "true"
-FROM_EMAIL = os.getenv("FROM_EMAIL", "")
-TO_EMAIL = os.getenv("TO_EMAIL", "")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
+# Optional email settings (robust defaults / safe skipping)
+ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "false").strip().lower() == "true"
+FROM_EMAIL = (os.getenv("FROM_EMAIL") or "").strip()
+TO_EMAIL = (os.getenv("TO_EMAIL") or "").strip()
+SMTP_SERVER = (os.getenv("SMTP_SERVER") or "").strip()
+# handle empty string safely
+SMTP_PORT = int((os.getenv("SMTP_PORT") or "587").strip() or "587")
+SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
+SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
 
 # ---- Report config ----------------------------------------------------------
 REPORT_TITLE = "Statement of Capital Flows"
 DEFAULT_FILENAME = f"capital_flows_{YESTERDAY.isoformat()}.xlsx"
+
+
+def email_config_ok() -> bool:
+    """Return True only if emailing is enabled AND all fields are non-empty."""
+    if not ENABLE_EMAIL:
+        return False
+    required = [FROM_EMAIL, TO_EMAIL, SMTP_SERVER, str(SMTP_PORT), SMTP_USER, SMTP_PASS]
+    if any(not v for v in required):
+        print("[INFO] Email not sent: ENABLE_EMAIL=true but one or more SMTP fields are blank.")
+        return False
+    return True
 
 
 # =============================== Core logic =================================
@@ -210,16 +222,15 @@ async def run_automation():
         await context.close()
         await browser.close()
 
-    if ENABLE_EMAIL:
+    # Optional email (only if fully configured)
+    if email_config_ok():
         email_files([file_path])
+    else:
+        print("[INFO] Skipping email step.")
 
 
 # =============================== Email helper ================================
 def email_files(paths):
-    if not TO_EMAIL:
-        print("[WARN] ENABLE_EMAIL is true but TO_EMAIL is empty; skipping email.")
-        return
-
     msg = MIMEMultipart()
     msg["From"] = FROM_EMAIL
     msg["To"] = TO_EMAIL
