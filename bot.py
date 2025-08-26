@@ -21,17 +21,16 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # ---- Secrets / Environment --------------------------------------------------
 USERNAME = os.getenv("WEBSITE_USER", "")
 PASSWORD = os.getenv("WEBSITE_PASS", "")
-LOGIN_URL = os.getenv(
-    "LOGIN_URL",
-    "https://eclientreporting.nuvamaassetservices.com/wealthspectrum/app/loginWith",
-)
+
+# Safe fallback: if secret LOGIN_URL is unset OR empty, use default
+LOGIN_URL = (os.getenv("LOGIN_URL") or
+             "https://eclientreporting.nuvamaassetservices.com/wealthspectrum/app/loginWith")
 
 # Optional email settings (robust defaults / safe skipping)
 ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "false").strip().lower() == "true"
 FROM_EMAIL = (os.getenv("FROM_EMAIL") or "").strip()
 TO_EMAIL = (os.getenv("TO_EMAIL") or "").strip()
 SMTP_SERVER = (os.getenv("SMTP_SERVER") or "").strip()
-# handle empty string safely
 SMTP_PORT = int((os.getenv("SMTP_PORT") or "587").strip() or "587")
 SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
 SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
@@ -58,6 +57,12 @@ async def run_automation():
     if not USERNAME or not PASSWORD:
         raise RuntimeError(
             "Missing WEBSITE_USER or WEBSITE_PASS. Add them as GitHub Secrets or environment variables."
+        )
+
+    # Sanity check for LOGIN_URL
+    if not (isinstance(LOGIN_URL, str) and LOGIN_URL.startswith("http")):
+        raise RuntimeError(
+            "LOGIN_URL is invalid or empty. Fix the secret or let the default be used."
         )
 
     async with async_playwright() as pw:
