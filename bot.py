@@ -1,4 +1,16 @@
 import os
+continue
+return None
+
+
+# Poll until the icon becomes available (spinner disappears)
+btn = None
+for _ in range(120): # ~120 * 500ms = 60s
+btn = await find_download_button()
+if btn:
+break
+await page.wait_for_timeout(500)
+if not btn:
 raise RuntimeError("Report did not become downloadable in time. Increase timeout or refine selectors.")
 
 
