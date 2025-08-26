@@ -36,12 +36,11 @@ SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
 SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
 
 # ---- Report config ----------------------------------------------------------
-REPORT_TITLE = "Statement of Capital Flows"
+REPORT_TITLE = os.getenv("REPORT_TITLE", "Statement of Capital Flows")
 DEFAULT_FILENAME = f"capital_flows_{YESTERDAY.isoformat()}.xlsx"
 
-
+# ============================ Helpers ========================================
 def email_config_ok() -> bool:
-    """Return True only if emailing is enabled AND all fields are non-empty."""
     if not ENABLE_EMAIL:
         return False
     required = [FROM_EMAIL, TO_EMAIL, SMTP_SERVER, str(SMTP_PORT), SMTP_USER, SMTP_PASS]
@@ -50,20 +49,116 @@ def email_config_ok() -> bool:
         return False
     return True
 
+async def safe_screenshot(page, name: str):
+    try:
+        path = DOWNLOAD_DIR / name
+        await page.screenshot(path=str(path), full_page=True)
+        print(f"[DEBUG] Saved screenshot: {path}")
+    except Exception as e:
+        print(f"[DEBUG] Failed to capture screenshot: {e}")
+
+async def select_report_by_text(page, label_text: str, option_text: str, timeout_ms: int = 8000):
+    """
+    Tries multiple strategies to select a report option by visible text.
+    Works with native <select> or custom dropdowns (combobox -> listbox/options, li items, menus).
+    """
+    # 1) Native <select> near the 'Report' label
+    try:
+        sel = page.locator("select").filter(has=page.get_by_text(label_text, exact=False))
+        if await sel.count() == 0:
+            sel = page.locator("select").first
+        await sel.wait_for(state="visible", timeout=timeout_ms)
+        await sel.select_option(label=option_text)
+        return True
+    except Exception:
+        pass
+
+    # 2) Click a combobox near the label, then choose option by role
+    try:
+        # Try a labeled combobox
+        label = page.get_by_text(label_text, exact=False).first
+        # Find a combobox in the same row/section
+        combo = page.get_by_role("combobox")
+        # Prefer the first combobox that appears after clicking near label
+        try:
+            await label.click(timeout=2000)
+        except Exception:
+            pass
+        await combo.first.click(timeout=timeout_ms)
+
+        # Options by ARIA role
+        listbox = page.get_by_role("listbox")
+        if await listbox.count() > 0:
+            opt = listbox.get_by_role("option", name=re.compile(re.escape(option_text), re.I)).first
+            await opt.click(timeout=timeout_ms)
+            return True
+
+        # Options as menu items
+        menuitem = page.get_by_role("menuitem", name=re.compile(re.escape(option_text), re.I)).first
+        await menuitem.click(timeout=timeout_ms)
+        return True
+    except Exception:
+        pass
+
+    # 3) Generic dropdown patterns: open a trigger near 'Report', then click text in a popup/panel
+    try:
+        # Common triggers: elements with down-arrow icons or classes, buttons near "Report"
+        triggers = [
+            page.locator("button:has(svg)"),
+            page.locator("button:has(i)"),
+            page.locator("button[aria-haspopup='listbox']"),
+            page.locator("span:has(svg)"),
+            page.locator("div[role='button']"),
+        ]
+        # Try each trigger to open a panel
+        opened = False
+        for t in triggers:
+            if await t.count() == 0:
+                continue
+            try:
+                await t.first.click(timeout=1500)
+                # If a panel/popup appears, we proceed
+                if await page.locator("[role='listbox'], .dropdown-menu, .mat-select-panel, ul[role='listbox']").count() > 0:
+                    opened = True
+                    break
+            except Exception:
+                continue
+
+        # Try to click the option by visible text anywhere in an open panel
+        if opened:
+            candidates = [
+                page.get_by_role("option", name=re.compile(re.escape(option_text), re.I)).first,
+                page.get_by_text(option_text, exact=False).first,
+                page.locator("li", has_text=re.compile(re.escape(option_text), re.I)).first,
+                page.locator("[role='menuitem']", has_text=re.compile(re.escape(option_text), re.I)).first,
+            ]
+            for c in candidates:
+                try:
+                    await c.click(timeout=timeout_ms)
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 4) Absolute fallback: search for any element with the exact text and click it
+    try:
+        await page.get_by_text(option_text, exact=False).first.click(timeout=timeout_ms)
+        return True
+    except Exception:
+        pass
+
+    return False
 
 # =============================== Core logic =================================
 async def run_automation():
     # Fail fast if creds missing
     if not USERNAME or not PASSWORD:
-        raise RuntimeError(
-            "Missing WEBSITE_USER or WEBSITE_PASS. Add them as GitHub Secrets or environment variables."
-        )
+        raise RuntimeError("Missing WEBSITE_USER or WEBSITE_PASS. Add them as GitHub Secrets or env vars.")
 
     # Sanity check for LOGIN_URL
     if not (isinstance(LOGIN_URL, str) and LOGIN_URL.startswith("http")):
-        raise RuntimeError(
-            "LOGIN_URL is invalid or empty. Fix the secret or let the default be used."
-        )
+        raise RuntimeError("LOGIN_URL is invalid or empty. Fix the secret or let the default be used.")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -99,61 +194,34 @@ async def run_automation():
                 pass
 
         if not filled:
+            await safe_screenshot(page, "debug_login_fields.png")
             raise RuntimeError("Could not locate login fields. Update selectors in bot.py.")
 
         # Click Log in
         try:
             await page.get_by_role("button", name=re.compile(r"log ?in", re.I)).click()
         except PWTimeoutError:
-            # Generic submit fallback
             await page.click("button[type='submit']")
         await page.wait_for_load_state("networkidle")
 
         # ----------------------- 2) REPORTS TAB ------------------------------
-        # Click the first visible Reports link (avoid strict mode violation)
         try:
-            # Prefer stable URL match if present
             await page.locator("a[href*='/app/reports']").first.click(timeout=8000)
         except PWTimeoutError:
-            # Fallback: role-based, then pick the first visible element
             reports_links = page.get_by_role("link", name=re.compile(r"reports?", re.I))
             if await reports_links.count() == 0:
-                # Some UIs use buttons/spans for menu
                 await page.get_by_text("Reports", exact=False).first.click()
             else:
                 await reports_links.first.click()
         await page.wait_for_load_state("networkidle")
 
         # ----------------------- 3) SELECT REPORT ----------------------------
-        # First try a native <select> adjacent to "Report"
-        selected = False
-        try:
-            sel = page.locator("select").filter(has=page.get_by_text("Report"))
-            if await sel.count() == 0:
-                sel = page.locator("select").first
-            await sel.select_option(label=REPORT_TITLE)
-            selected = True
-        except Exception:
-            # Custom dropdown: click combobox then option
-            try:
-                dd = page.get_by_role("combobox").first
-                await dd.click()
-                await page.get_by_role("option", name=REPORT_TITLE).click()
-                selected = True
-            except Exception:
-                # Very generic fallback: click near the "Report" label then the option text
-                try:
-                    await page.get_by_text("Report", exact=False).first.click()
-                    await page.get_by_text(REPORT_TITLE, exact=False).first.click()
-                    selected = True
-                except Exception:
-                    pass
-
-        if not selected:
-            raise RuntimeError("Could not select 'Statement of Capital Flows' in a dropdown. Update selectors.")
+        ok = await select_report_by_text(page, label_text="Report", option_text=REPORT_TITLE, timeout_ms=9000)
+        if not ok:
+            await safe_screenshot(page, "debug_select_report_failed.png")
+            raise RuntimeError(f"Could not select '{REPORT_TITLE}' in a dropdown. Update selectors.")
 
         # ----------------------- 4) DATE = YESTERDAY -------------------------
-        # Try HTML5 date inputs first
         date_set = False
         iso_date = YESTERDAY.strftime("%Y-%m-%d")
         dmy_date = YESTERDAY.strftime("%d-%m-%Y")
@@ -165,13 +233,11 @@ async def run_automation():
             await to_inp.fill(iso_date)
             date_set = True
         except Exception:
-            # Try label-based
             try:
                 await page.get_by_label(re.compile(r"from date|start date", re.I)).fill(iso_date)
                 await page.get_by_label(re.compile(r"to date|end date", re.I)).fill(iso_date)
                 date_set = True
             except Exception:
-                # Fallback: two text inputs near a "Date" label; try d-m-Y format
                 try:
                     grp = page.get_by_text("Date", exact=False).locator("xpath=ancestor::*[1]")
                     inputs = grp.locator("input")
@@ -189,19 +255,21 @@ async def run_automation():
         try:
             await page.get_by_role("button", name=re.compile("execute", re.I)).click()
         except PWTimeoutError:
-            await page.get_by_text("Execute", exact=False).first.click()
+            try:
+                await page.get_by_text("Execute", exact=False).first.click()
+            except Exception:
+                await safe_screenshot(page, "debug_execute_click_failed.png")
+                raise
 
         # ----------------------- 6) WAIT + DOWNLOAD --------------------------
-        # Find the result row for our report, wait until a download icon appears, then click.
         async def find_download_button():
-            # A row containing the report title
             row = page.get_by_role("row").filter(has=page.get_by_text(REPORT_TITLE, exact=False)).first
-            # Candidate clickable elements
             candidates = [
                 row.get_by_role("button", name=re.compile(r"download|document|file|xlsx|excel|csv", re.I)),
                 row.get_by_role("link", name=re.compile(r"download|document|file|xlsx|excel|csv", re.I)),
                 row.locator("a[download]"),
                 row.locator("button:has(svg), a:has(svg)"),
+                page.get_by_role("button", name=re.compile(r"document", re.I)).first,
             ]
             for c in candidates:
                 try:
@@ -211,15 +279,15 @@ async def run_automation():
                     continue
             return None
 
-        # Poll for up to ~60 seconds (spinner → document icon)
         btn = None
-        for _ in range(120):  # 120 * 500ms = ~60s
+        for _ in range(160):  # ~80s @ 500ms
             btn = await find_download_button()
             if btn:
                 break
             await page.wait_for_timeout(500)
 
         if not btn:
+            await safe_screenshot(page, "debug_download_icon_missing.png")
             raise RuntimeError("Report did not become downloadable in time. Increase timeout or refine selectors.")
 
         async with page.expect_download() as dl_info:
@@ -233,12 +301,10 @@ async def run_automation():
         await context.close()
         await browser.close()
 
-    # Optional email (only if fully configured)
     if email_config_ok():
         email_files([file_path])
     else:
         print("[INFO] Skipping email step.")
-
 
 # =============================== Email helper ================================
 def email_files(paths):
@@ -263,7 +329,6 @@ def email_files(paths):
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
         print("Email sent to:", TO_EMAIL)
-
 
 # =============================== Entrypoint ==================================
 if __name__ == "__main__":
